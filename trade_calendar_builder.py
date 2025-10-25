@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Interactive Trade Calendar — PRO (Dark+Blue UI, clearer calendar, slimmer sidepane)
+Interactive Trade Calendar — PRO (Dark+Blue UI, clearer calendar, slimmer sidepane, fee-aware summaries)
 
-What’s new vs your last file:
-  • True dark theme (deep navy) + modern blue buttons
-  • “6 trades” (or “1 trade”) instead of “#6”
-  • Better contrast & slightly larger fonts in the calendar cells
-  • Right side pane narrowed for more calendar room
+New in this version:
+  • Right-side "Day Summary" that separates TRADING P&L (ex-fees) from FEES (–$2 rows)
+  • Fee-only day badge when a day contains only –$2 fee rows
+  • Month stats now include: Month Fees and Month Trading P&L (ex-fees), plus Fee-only day count
 
 CSV expectation (semicolon-separated preferred):
   "Date/Time" (dd/mm/YYYY HH:MM:SS), "Net P/L"
@@ -152,18 +151,34 @@ def merge_csvs(paths: list[Path]) -> pd.DataFrame:
         all_df = all_df.drop_duplicates(subset=dedupe_cols, keep='first').reset_index(drop=True)
     return all_df.sort_values('Date').reset_index(drop=True)
 
+# ----------------------------- Fee helpers -----------------------------
+FEE_VALUE = -2.0  # –$2 lines are fees
+FEE_EPS = 1e-6
+
+def fee_mask(df: pd.DataFrame) -> pd.Series:
+    """True for rows considered 'fee' based on –$2 Net_PnL."""
+    return df['Net_PnL'].apply(lambda v: (not pd.isna(v)) and abs(float(v) - FEE_VALUE) < FEE_EPS)
+
+def split_fees(df: pd.DataFrame):
+    """Return (trades_df_without_fees, fees_df)."""
+    m = fee_mask(df)
+    return df[~m].copy(), df[m].copy()
+
 # ----------------------------- Aggregations -----------------------------
 def daily_summary(df: pd.DataFrame, symbol_filter: str|None=None) -> pd.DataFrame:
     d = df.copy()
     if symbol_filter:
         d = d[d['Symbol'].astype(str).str.upper().str.contains(symbol_filter.upper(), na=False)]
-    daily = (d.groupby(d['Date'].dt.date)
-               .agg(net=('Net_PnL','sum'),
-                    orders=('Date','count'))
-               .reset_index()
-               .rename(columns={'Date':'day'})
-               .sort_values('day'))
-    return daily
+    # totals (incl fees)
+    daily_tot = (d.groupby(d['Date'].dt.date)['Net_PnL'].sum().rename('net'))
+    # fees per day
+    fees = d[fee_mask(d)].groupby(d[fee_mask(d)]['Date'].dt.date)['Net_PnL'].sum().rename('fees')
+    # orders per day (all rows)
+    orders = d.groupby(d['Date'].dt.date)['Date'].count().rename('orders')
+    out = pd.concat([daily_tot, fees, orders], axis=1).fillna({'fees':0})
+    out['trading_net'] = out['net'] - out['fees']
+    out = out.reset_index().rename(columns={'Date':'day'}).sort_values('day')
+    return out
 
 def per_day_by_symbol(df: pd.DataFrame) -> pd.DataFrame:
     d = df.copy()
@@ -189,16 +204,30 @@ def monthly_slice(df: pd.DataFrame, year: int, month: int, symbol_filter: str|No
 def monthly_stats(df: pd.DataFrame, year: int, month: int, symbol_filter: str|None=None) -> dict:
     d = monthly_slice(df, year, month, symbol_filter)
     if d.empty:
-        return dict(net=0.0, orders=0, trade_days=0, pos_days=0, pos_rate=0.0, avg_per_order=0.0)
+        return dict(net=0.0, fees=0.0, trading_net=0.0,
+                    orders=0, trade_days=0, pos_days=0, pos_rate=0.0, fee_only_days=0, avg_per_order=0.0)
+    # day-level nets
     dd = d.groupby(d['Date'].dt.date)['Net_PnL'].sum()
+    # fees
+    fees_total = d[fee_mask(d)]['Net_PnL'].sum() if not d.empty else 0.0
+    net_all = float(d['Net_PnL'].sum())
+    trading_net = float(net_all - fees_total)
+    orders = int(len(d))
     pos_days = int((dd > 0).sum())
     trade_days = int((dd != 0).sum()) if len(dd) else 0
-    orders = int(len(d))
-    net = float(d['Net_PnL'].sum())
-    avg_per_order = float(net / orders) if orders else 0.0
+
+    # fee-only days: days where all rows are fees
+    fee_days = 0
+    for _day, g in d.groupby(d['Date'].dt.date):
+        m = fee_mask(g)
+        if len(g) > 0 and m.all():
+            fee_days += 1
+
+    avg_per_order = float(net_all / orders) if orders else 0.0
     pos_rate = float(100 * pos_days / max(trade_days, 1))
-    return dict(net=net, orders=orders, trade_days=trade_days, pos_days=pos_days,
-                pos_rate=pos_rate, avg_per_order=avg_per_order)
+    return dict(net=net_all, fees=float(fees_total), trading_net=trading_net,
+                orders=orders, trade_days=trade_days, pos_days=pos_days, pos_rate=pos_rate,
+                fee_only_days=fee_days, avg_per_order=avg_per_order)
 
 # ----------------------------- PNG render (offscreen) -----------------------------
 def draw_month_to_image(year:int, month:int, day_data:dict, firstweekday:int, profits_only:bool, symbol_filter:str|None, theme:str) -> Image.Image:
@@ -255,7 +284,7 @@ def draw_month_to_image(year:int, month:int, day_data:dict, firstweekday:int, pr
 
             info = day_data.get(d, None)
             if in_month and info:
-                net = info['net']
+                net = info.get('net', 0.0)
                 txt = "-" if (profits_only and (net <= 0)) else fmt_usd(net)
                 color = green if net > 0 else (red if net < 0 else gray)
                 bb = draw.textbbox((0,0), txt, font=font_mid)
@@ -491,8 +520,21 @@ class App(tk.Tk):
         rightpane = ttk.Frame(body, width=SIDEPANE_W)
         rightpane.pack(side=tk.RIGHT, fill=tk.BOTH)
 
+        # ---- Day Summary (fee-aware) ----
         self.day_label = ttk.Label(rightpane, text="(Select a day)", font=("Segoe UI", 12, "bold"))
         self.day_label.pack(anchor="w", pady=(4,6))
+
+        summary_frame = ttk.LabelFrame(rightpane, text="Day Summary")
+        summary_frame.pack(fill=tk.X, pady=(0,8))
+        self.lab_net = ttk.Label(summary_frame, text="Net P&L: –")
+        self.lab_trading = ttk.Label(summary_frame, text="Trading P&L (ex-fees): –")
+        self.lab_fees = ttk.Label(summary_frame, text="Fees: –")
+        self.lab_orders = ttk.Label(summary_frame, text="Orders: –")
+        self.lab_symbols = ttk.Label(summary_frame, text="Symbols: –")
+        self.lab_badge = ttk.Label(summary_frame, text="", foreground=NEG_RED)
+
+        for w in [self.lab_net, self.lab_trading, self.lab_fees, self.lab_orders, self.lab_symbols, self.lab_badge]:
+            w.pack(anchor="w", padx=8, pady=1)
 
         ttk.Label(rightpane, text="Per-stock P&L").pack(anchor="w")
         self.tree_sym = ttk.Treeview(rightpane, columns=("symbol","net","orders"), show="headings", height=6)
@@ -600,11 +642,14 @@ class App(tk.Tk):
         year, month = int(self.sel_year.get()), int(self.sel_month.get())
         fw = 6 if self.firstweekday.get() == "SUN" else 0
 
-        # monthly stats
+        # monthly stats (fee-aware)
         mstats = monthly_stats(self.df, year, month, sym_filter)
         self.month_label_stats.config(
             text=f"Month P&L: {fmt_usd(mstats['net'])}  |  "
+                 f"Month Trading P&L (ex-fees): {fmt_usd(mstats['trading_net'])}  |  "
+                 f"Month Fees: {fmt_usd(mstats['fees'])}  |  "
                  f"Trading Days: {mstats['trade_days']}  |  "
+                 f"Fee-only Days: {mstats['fee_only_days']}  |  "
                  f"Positive Day Rate: {mstats['pos_rate']:.0f}%  |  "
                  f"Avg/Order: {fmt_usd(mstats['avg_per_order'])}"
         )
@@ -777,11 +822,39 @@ class App(tk.Tk):
         if d is None:
             self.day_label.config(text="(Select a day)")
             self.notes_text.delete("1.0","end")
+            # clear summary
+            self.lab_net.config(text="Net P&L: –")
+            self.lab_trading.config(text="Trading P&L (ex-fees): –")
+            self.lab_fees.config(text="Fees: –")
+            self.lab_orders.config(text="Orders: –")
+            self.lab_symbols.config(text="Symbols: –")
+            self.lab_badge.config(text="")
             return
 
         self.day_label.config(text=d.strftime("%A, %d %B %Y"))
 
-        # per-stock for that day
+        # trades for that day (full)
+        tdf = self.trades_map.get(d, pd.DataFrame())
+
+        # fee split for summary
+        trades_no_fees, fees_df = split_fees(tdf) if not tdf.empty else (pd.DataFrame(), pd.DataFrame())
+        net_all = float(tdf['Net_PnL'].sum()) if not tdf.empty else 0.0
+        fees_total = float(fees_df['Net_PnL'].sum()) if not fees_df.empty else 0.0
+        trading_net = float(net_all - fees_total)
+
+        # fee-only badge
+        fee_only = (not tdf.empty) and (not trades_no_fees.shape[0] and fees_df.shape[0] > 0)
+        self.lab_badge.config(text=("FEE-ONLY DAY" if fee_only else ""))
+
+        # update summary labels
+        self.lab_net.config(text=f"Net P&L: {fmt_usd(net_all)}")
+        self.lab_trading.config(text=f"Trading P&L (ex-fees): {fmt_usd(trading_net)}")
+        self.lab_fees.config(text=f"Fees: {fmt_usd(fees_total)}")
+        self.lab_orders.config(text=f"Orders: {len(tdf)}")
+        syms = ", ".join(sorted(set([s for s in tdf['Symbol'].astype(str).tolist() if s and s != 'nan']))) if not tdf.empty else "-"
+        self.lab_symbols.config(text=f"Symbols: {syms if syms else '-'}")
+
+        # per-stock for that day (uses original by_symbol; fees typically have empty symbol)
         if not self.by_symbol.empty:
             sym_filter = self.symbol_filter.get().strip()
             data = self.by_symbol[self.by_symbol['day'] == d]
@@ -791,8 +864,7 @@ class App(tk.Tk):
             for _, r in data.iterrows():
                 self.tree_sym.insert("", "end", values=(r['Symbol'], fmt_usd(r['net']), int(r['orders'])))
 
-        # trades for that day
-        tdf = self.trades_map.get(d, pd.DataFrame())
+        # trades table (all rows so you can see fees too)
         if not tdf.empty:
             sym_filter = self.symbol_filter.get().strip()
             if sym_filter:
@@ -958,6 +1030,7 @@ class App(tk.Tk):
             "• Swipe left/right, or use ←/→, or Prev/Next to change months\n"
             "• Click a day to see per-stock P&L and trades\n"
             "• “n trades” shows number of orders that day\n"
+            "• –$2 rows are counted as FEES in Day/Month summaries\n"
             "• Symbol filter matches substrings (e.g., 'SOXL')\n"
             "• View → Dark/Light theme\n"
             "• Tools → Equity curve (All or Month)\n"
