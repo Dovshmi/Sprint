@@ -77,9 +77,9 @@ def month_bounds(month_start: date):
     end = date(month_start.year, month_start.month, last_day)
     return start, end
 
-def month_weeks(month_start: date):
-    """Return list of weeks (each week is list of 7 dates) for the month, Monday-first."""
-    cal = calendar.Calendar(firstweekday=0)  # Monday = 0
+def month_weeks_sunday_first(month_start: date):
+    """Return list of weeks (each week is list of 7 dates) for the month, Sunday-first."""
+    cal = calendar.Calendar(firstweekday=6)  # Sunday = 6
     return cal.monthdatescalendar(month_start.year, month_start.month)
 
 # -----------------------------
@@ -92,8 +92,8 @@ with st.expander("How it works"):
     st.markdown(
         """
         Upload your **Colmex Pro Filled orders** CSV (semicolon `;`).  
-        Click a **day cell** in the calendar to see that day's trades.  
-        The calendar shows a small icon: 🟢 = profit, 🔴 = loss, ⚪ = flat/no trades.
+        Click a **day cell** to see that day's trades.  
+        Legend: 🟢 = profit, 🔴 = loss, ⚪ = flat/no trades.
         """
     )
 
@@ -132,55 +132,75 @@ if "selected_day" not in st.session_state:
 current_month = st.session_state.current_month
 selected_day = st.session_state.selected_day
 
-# Month navigation (single calendar)
+# Month navigation
 nav_l, nav_c, nav_r = st.columns([1,2,1])
 with nav_l:
-    if st.button("◀ Prev"):
-        prev_month = (current_month.replace(day=1) - pd.DateOffset(months=1)).date()
-        st.session_state.current_month = date(prev_month.year, prev_month.month, 1)
-        # keep selected_day in bounds if needed
-        selected_day = st.session_state.selected_day
+    if st.button("◀ Prev", key="nav_prev"):
+        y, m = current_month.year, current_month.month
+        if m == 1:
+            y, m = y - 1, 12
+        else:
+            m -= 1
+        st.session_state.current_month = date(y, m, 1)
 
 with nav_c:
-    month_name = current_month.strftime("%B %Y")
-    st.markdown(f"### {month_name}")
+    st.markdown(f"### {current_month.strftime('%B %Y')}")
 
 with nav_r:
-    if st.button("Next ▶"):
-        next_month = (current_month.replace(day=1) + pd.DateOffset(months=1)).date()
-        st.session_state.current_month = date(next_month.year, next_month.month, 1)
-        selected_day = st.session_state.selected_day
+    if st.button("Next ▶", key="nav_next"):
+        y, m = current_month.year, current_month.month
+        if m == 12:
+            y, m = y + 1, 1
+        else:
+            m += 1
+        st.session_state.current_month = date(y, m, 1)
 
 # Slice data for current month
 m_start, m_end = month_bounds(st.session_state.current_month)
 month_mask = (daily["date"].dt.date >= m_start) & (daily["date"].dt.date <= m_end)
 month_df = daily.loc[month_mask].copy()
 
-# Map date -> (pnl, trades, fees)
+# Maps
 pnl_map = {d.date(): float(p) for d, p in zip(month_df["date"], month_df["pnl"])}
 trd_map = {d.date(): int(t) for d, t in zip(month_df["date"], month_df["trades"])}
 fee_map = {d.date(): float(f) for d, f in zip(month_df["date"], month_df["fees"])}
 
-# Build calendar grid (buttons per day in current month only)
-day_rows = month_weeks(st.session_state.current_month)
+# Legend & weekday header
+legend_cols = st.columns([1,1,1,7])
+with legend_cols[0]: st.markdown("🟢 **Profit**")
+with legend_cols[1]: st.markdown("🔴 **Loss**")
+with legend_cols[2]: st.markdown("⚪ **Flat**")
+
+WEEKDAYS = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"]
+header_cols = st.columns(7)
+for i, name in enumerate(WEEKDAYS):
+    with header_cols[i]:
+        st.markdown(f"<div style='text-align:center;font-weight:600;'>{name}</div>", unsafe_allow_html=True)
+
+# Calendar grid (buttons per day in current month only)
+day_rows = month_weeks_sunday_first(st.session_state.current_month)
 st.write("")
+month_key = st.session_state.current_month.strftime("%Y-%m")
 for week in day_rows:
     cols = st.columns(7)
     for idx, d in enumerate(week):
         with cols[idx]:
             if d.month != st.session_state.current_month.month:
-                st.write("")
+                st.markdown("<div style='height:2.2rem;'></div>", unsafe_allow_html=True)
                 continue
             pnl = pnl_map.get(d, 0.0)
             trades = trd_map.get(d, 0)
+            fees = fee_map.get(d, 0.0)
             icon = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
-            label = f"{d.day} {icon}\n{style_currency(pnl)}"
-            if st.button(label, key=f"day_{d.isoformat()}"):
+            day_str = f"{d.day:02d} {icon}"
+            pnl_str = f"{style_currency(pnl)}"
+            label = f"{day_str}\n{pnl_str}"
+            help_txt = f"Date: {d.isoformat()} | P&L: {style_currency(pnl)} | Fees: {style_currency(fees)} | Trades: {trades}"
+            # Key includes month to avoid duplicates across renders
+            if st.button(label, key=f"day_{month_key}_{d.isoformat()}", help=help_txt):
                 st.session_state.selected_day = d
 
-# -----------------------------
-# Right-side summary and details
-# -----------------------------
+# Details + summary
 left, right = st.columns([3,2], vertical_alignment="top")
 
 with left:
@@ -199,12 +219,10 @@ with left:
 
 with right:
     st.subheader("Summary")
-    # Selected day
     sel = daily[daily["date"].dt.date == st.session_state.selected_day]
     day_pnl = float(sel["pnl"].sum()) if not sel.empty else 0.0
     day_fees = float(sel["fees"].sum()) if not sel.empty else 0.0
 
-    # Monthly and total
     monthly_pnl = float(month_df["pnl"].sum()) if not month_df.empty else 0.0
     monthly_fees = float(month_df["fees"].sum()) if not month_df.empty else 0.0
     total_pnl = float(daily["pnl"].sum())
