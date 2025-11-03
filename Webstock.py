@@ -1,16 +1,16 @@
-
+# Webstock_v3.py
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 import calendar
 import re
+import altair as alt
 
 # -----------------------------
 # Helpers
 # -----------------------------
 def normalize_numeric(x):
-    """Extract numeric from strings like '266.40 USD', '1,234.56', '-2.00', '39 NVDG' -> float or NaN."""
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return np.nan
     s = str(x).strip().replace(",", "")
@@ -23,19 +23,18 @@ def normalize_numeric(x):
         return np.nan
 
 def load_colmex_csv(file) -> pd.DataFrame:
-    """Reads Colmex 'Filled orders' CSV (semicolon-delimited), parses columns & datetimes (day-first)."""
     df = pd.read_csv(file, sep=";", engine="python")
-    # Common numeric fields
     for col in ["Gross P/L", "Execution fee", "Net P/L", "Price", "Quantity"]:
         if col in df.columns:
             df[col] = df[col].apply(normalize_numeric)
 
     if "Date/Time" not in df.columns:
         raise ValueError("Missing 'Date/Time' column in the CSV.")
+
+    df = df.copy()
     df["Date/Time"] = df["Date/Time"].astype(str).str.replace("\xa0", " ").str.strip()
     df["Date/Time"] = df["Date/Time"].str.replace(r"\s+", " ", regex=True)
 
-    # Day-first parsing (e.g., 29.10.2025 15:55:13)
     df["datetime"] = pd.to_datetime(df["Date/Time"], dayfirst=True, errors="coerce")
     if df["datetime"].isna().all():
         raise ValueError("Could not parse 'Date/Time'. Ensure day-first format like 29.10.2025 15:55:13")
@@ -49,7 +48,7 @@ def load_colmex_csv(file) -> pd.DataFrame:
 
     fees = df["Execution fee"] if "Execution fee" in df.columns else 0.0
     df["__fees__"] = pd.to_numeric(fees, errors="coerce").fillna(0.0).astype(float)
-
+    df["Net P/L"] = pd.to_numeric(df["Net P/L"], errors="coerce").fillna(0.0).astype(float)
     return df
 
 def build_daily_pnl(df: pd.DataFrame) -> pd.DataFrame:
@@ -71,16 +70,20 @@ def style_currency(x):
     return f"{sign}${abs(v):,.2f}"
 
 def month_bounds(month_start: date):
-    """Return first and last dates (inclusive) for the given month_start (assumed first of month)."""
     last_day = calendar.monthrange(month_start.year, month_start.month)[1]
     start = date(month_start.year, month_start.month, 1)
     end = date(month_start.year, month_start.month, last_day)
     return start, end
 
 def month_weeks_sunday_first(month_start: date):
-    """Return list of weeks (each week is list of 7 dates) for the month, Sunday-first."""
-    cal = calendar.Calendar(firstweekday=6)  # Sunday = 6
+    cal = calendar.Calendar(firstweekday=6)  # Sunday
     return cal.monthdatescalendar(month_start.year, month_start.month)
+
+def sunday_week_bounds(d: date):
+    sunday_offset = (d.weekday() + 1) % 7  # Sun->0, Mon->1,...
+    start = d - timedelta(days=sunday_offset)
+    end = start + timedelta(days=6)
+    return start, end
 
 # -----------------------------
 # Streamlit App
@@ -196,9 +199,9 @@ for week in day_rows:
             pnl_str = f"{style_currency(pnl)}"
             label = f"{day_str}\n{pnl_str}"
             help_txt = f"Date: {d.isoformat()} | P&L: {style_currency(pnl)} | Fees: {style_currency(fees)} | Trades: {trades}"
-            # Key includes month to avoid duplicates across renders
             if st.button(label, key=f"day_{month_key}_{d.isoformat()}", help=help_txt):
                 st.session_state.selected_day = d
+                selected_day = d  # local update for charts below
 
 # Details + summary
 left, right = st.columns([3,2], vertical_alignment="top")
@@ -241,3 +244,78 @@ with right:
     metric_row("Total Fees (all data)", total_fees)
 
 st.caption("Tip: Click a day in the calendar above. 🟢 profit, 🔴 loss, ⚪ no trades.")
+
+# -----------------------------
+# ONE lightweight chart (line + dots) with time-aware x-axes
+# -----------------------------
+st.subheader("Performance Graph")
+
+def alt_theme():
+    return {
+        "config": {
+            "view": {"continuousWidth": 780, "continuousHeight": 280},
+            "axis": {"labelFontSize": 12, "titleFontSize": 12, "grid": False},
+            "legend": {"labelFontSize": 12, "titleFontSize": 12}
+        }
+    }
+alt.themes.register("minimal_trade_theme", alt_theme)
+alt.themes.enable("minimal_trade_theme")
+
+view = st.selectbox("View", ["Daily", "Weekly", "Monthly", "Yearly"], index=0)
+
+def render_line_dots(df, x_field, x_title):
+    if df.empty:
+        st.info("No data for this selection.")
+        return
+    base = alt.Chart(df).encode(
+        x=alt.X(f"{x_field}", title=x_title),
+        y=alt.Y("pnl:Q", title="P&L ($)"),
+        tooltip=[c for c in df.columns if c != "pnl"]
+    )
+    chart = base.mark_line(size=1) + base.mark_point(size=60, filled=True)
+    st.altair_chart(chart.interactive(), use_container_width=True)
+
+# ---- DAILY: X = Trade time (datetime), Y = cumulative Net P&L ----
+if view == "Daily":
+    dtr = raw.loc[raw["date"].dt.date == selected_day].copy()
+    if dtr.empty:
+        st.info("No trades on the selected day.")
+    else:
+        dtr = dtr.sort_values("datetime").reset_index(drop=True)
+        dtr["pnl"] = dtr["Net P/L"].cumsum()
+        dplot = dtr[["datetime","pnl","Symbol","Net P/L"]]
+        render_line_dots(dplot, "datetime:T", "Time")
+
+# ---- WEEKLY: Sunday -> Saturday of selected day week; fill missing days with 0 ----
+elif view == "Weekly":
+    w_start, w_end = sunday_week_bounds(selected_day)
+    rng = pd.date_range(w_start, w_end, freq="D")
+    wk = daily.loc[(daily["date"].dt.date >= w_start) & (daily["date"].dt.date <= w_end)][["date","pnl"]].copy()
+    wk = wk.set_index("date").reindex(rng, fill_value=0.0).rename_axis("date").reset_index()
+    wk = wk.rename(columns={"index":"date"})
+    render_line_dots(wk.rename(columns={"date":"x"}), "x:T", f"Week {w_start.isoformat()} → {w_end.isoformat()}")
+
+# ---- MONTHLY: full current month (all days), fill missing with 0 ----
+elif view == "Monthly":
+    m0, m1 = month_bounds(current_month)
+    rng = pd.date_range(m0, m1, freq="D")
+    md = month_df[["date","pnl"]].copy()
+    md = md.set_index("date").reindex(rng, fill_value=0.0).rename_axis("date").reset_index()
+    render_line_dots(md.rename(columns={"date":"x"}), "x:T", current_month.strftime("Days of %B %Y"))
+
+# ---- YEARLY: same as monthly but aggregated by WEEK (Sunday-start → W-SAT), fill missing with 0 ----
+elif view == "Yearly":
+    year = selected_day.year
+    y0 = date(year, 1, 1)
+    y1 = date(year, 12, 31)
+    yr = daily.loc[(daily["date"].dt.date >= y0) & (daily["date"].dt.date <= y1)][["date","pnl"]].copy()
+    # Resample by week ending on Saturday to match Sunday-start calendar
+    yr = (yr.set_index("date")
+            .resample("W-SAT").sum()
+            .rename_axis("week_end")
+            .reset_index()
+            .rename(columns={"week_end":"x"}))
+    # Create full weekly index to include empty weeks
+    full_weeks = pd.date_range(pd.Timestamp(y0), pd.Timestamp(y1), freq="W-SAT")
+    yr = yr.set_index("x").reindex(full_weeks, fill_value=0.0).rename_axis("x").reset_index()
+    render_line_dots(yr, "x:T", f"Weeks of {year}")
