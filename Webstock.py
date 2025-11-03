@@ -1,4 +1,4 @@
-# Webstock_v8.py
+# Webstock_v9.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -40,6 +40,7 @@ def load_colmex_csv(file) -> pd.DataFrame:
         raise ValueError("Could not parse 'Date/Time'. Ensure day-first format like 29.10.2025 15:55:13")
     df["date"] = df["datetime"].dt.floor("D")
 
+    # Derive Net P/L if missing
     if "Net P/L" not in df.columns or df["Net P/L"].isna().all():
         net = None
         if "Gross P/L" in df.columns and "Execution fee" in df.columns:
@@ -90,16 +91,16 @@ def sunday_week_bounds(d: date):
     return start, end
 
 # Winners/Losers helpers (by Net P/L sign)
-def _names_for_sign(series: pd.Series) -> str:
-    s = sorted(set(series.dropna().tolist()))
+def _names_list(series: pd.Series):
+    s = sorted(set([str(x) for x in series.dropna().tolist()]))
     return ", ".join(s) if s else "—"
 
 def winners_losers_by_day(raw: pd.DataFrame):
     if "Symbol" not in raw.columns:
         return {}, {}
     tmp = raw.groupby(["date","Symbol"], as_index=False)["Net P/L"].sum()
-    winners = tmp[tmp["Net P/L"] > 0].groupby("date")["Symbol"].apply(_names_for_sign).to_dict()
-    losers  = tmp[tmp["Net P/L"] < 0].groupby("date")["Symbol"].apply(_names_for_sign).to_dict()
+    winners = tmp[tmp["Net P/L"] > 0].groupby("date")["Symbol"].apply(_names_list).to_dict()
+    losers  = tmp[tmp["Net P/L"] < 0].groupby("date")["Symbol"].apply(_names_list).to_dict()
     return winners, losers
 
 def winners_losers_by_week(raw: pd.DataFrame):
@@ -111,9 +112,16 @@ def winners_losers_by_week(raw: pd.DataFrame):
     tmp = raw.copy()
     tmp["week_end"] = week_end
     g = tmp.groupby(["week_end","Symbol"], as_index=False)["Net P/L"].sum()
-    winners = g[g["Net P/L"] > 0].groupby("week_end")["Symbol"].apply(_names_for_sign).to_dict()
-    losers  = g[g["Net P/L"] < 0].groupby("week_end")["Symbol"].apply(_names_for_sign).to_dict()
+    winners = g[g["Net P/L"] > 0].groupby("week_end")["Symbol"].apply(_names_list).to_dict()
+    losers  = g[g["Net P/L"] < 0].groupby("week_end")["Symbol"].apply(_names_list).to_dict()
     return winners, losers
+
+def best_worst_day(daily_df: pd.DataFrame):
+    if daily_df.empty: 
+        return None, None
+    best_idx = daily_df["pnl"].idxmax()
+    worst_idx = daily_df["pnl"].idxmin()
+    return daily_df.loc[best_idx], daily_df.loc[worst_idx]
 
 # -----------------------------
 # Streamlit App
@@ -147,6 +155,7 @@ week_winners, week_losers = winners_losers_by_week(raw)
 
 # Data for calendar (Net P&L)
 daily_net = build_daily(raw, "Net P/L")
+daily_gross = build_daily(raw, "Gross P/L")
 min_day = daily_net["date"].min().date()
 max_day = daily_net["date"].max().date()
 
@@ -217,12 +226,15 @@ for week in day_rows:
             fees = fee_map.get(d, 0.0)
             icon = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
             label = f"{d.day:02d} {icon}\n{style_currency(pnl)}"
-            help_txt = f"Date: {d.isoformat()} | P&L: {style_currency(pnl)} | Fees: {style_currency(fees)} | Trades: {trades}"
+            # Tooltip now shows winners/losers instead of Date
+            winners_txt = day_winners.get(pd.Timestamp(d), "—")
+            losers_txt  = day_losers.get(pd.Timestamp(d), "—")
+            help_txt = f"Winners: {winners_txt} | Losers: {losers_txt} | P&L: {style_currency(pnl)} | Fees: {style_currency(fees)} | Trades: {trades}"
             if st.button(label, key=f"day_{month_key}_{d.isoformat()}", help=help_txt):
                 st.session_state.selected_day = d
                 selected_day = d
 
-# ---------- Day details panel (RESTORED) ----------
+# ---------- Day details panel ----------
 left, right = st.columns([3,2], vertical_alignment="top")
 with left:
     st.subheader(f"Trades on {selected_day}")
@@ -237,28 +249,108 @@ with left:
                 day_trades[cc] = day_trades[cc].apply(lambda x: style_currency(x) if pd.notna(x) else x)
         st.dataframe(day_trades[existing_cols], use_container_width=True, hide_index=True)
 
+# ---------- Customizable Summary (popover with checklist) ----------
 with right:
     st.subheader("Summary")
-    sel = daily_net[daily_net["date"].dt.date == selected_day]
-    day_pnl  = float(sel["pnl"].sum()) if not sel.empty else 0.0
-    day_fees = float(sel["fees"].sum()) if not sel.empty else 0.0
-    # Month totals (net)
-    monthly_pnl  = float(month_df["pnl"].sum()) if not month_df.empty else 0.0
-    monthly_fees = float(month_df["fees"].sum()) if not month_df.empty else 0.0
-    total_pnl  = float(daily_net["pnl"].sum())
-    total_fees = float(daily_net["fees"].sum())
+
+    # Popover if available; fallback to expander
+    pop = getattr(st, "popover", None)
+    container = pop("Summary options") if pop else st.expander("Summary options", expanded=False)
+
+    with container:
+        basis_opt = st.radio("P&L basis", ["Net (after fees)", "Gross (before fees)"], horizontal=True, index=0, key="sum_basis")
+        options = {
+            "sel_day_pnl": "Selected Day P&L",
+            "sel_day_fees": "Selected Day Fees",
+            "sel_day_trades": "Selected Day #Trades",
+            "month_pnl": f"{current_month.strftime('%B %Y')} P&L",
+            "month_fees": f"{current_month.strftime('%B %Y')} Fees",
+            "month_winners_losers": "Month Winners/Losers",
+            "total_pnl": "Total P&L (all data)",
+            "total_fees": "Total Fees (all data)",
+            "ytd_pnl": "YTD P&L",
+            "best_worst": "Best/Worst Day (all data)",
+            "win_rate": "Win rate (days with trades)",
+            "avg_daily": "Average daily P&L (with trades)",
+        }
+        default_sel = ["sel_day_pnl","sel_day_fees","month_pnl","month_fees","total_pnl","total_fees"]
+        selected_keys = st.multiselect("Show:", list(options.keys()), default_sel, format_func=lambda k: options[k])
+
+    # Choose basis for metrics
+    basis_col = "Net P/L" if st.session_state.get("sum_basis","Net").startswith("Net") else "Gross P/L"
+    daily_basis = build_daily(raw, basis_col)
+
+    # Values used in multiple cards
+    sel_row = daily_basis[daily_basis["date"].dt.date == selected_day]
+    day_pnl  = float(sel_row["pnl"].sum()) if not sel_row.empty else 0.0
+    day_fees = float(sel_row["fees"].sum()) if not sel_row.empty else 0.0
+    day_trade_count = int(sel_row["trades"].sum()) if not sel_row.empty else 0
+
+    m0, m1 = month_bounds(current_month)
+    month_rows = daily_basis[(daily_basis["date"].dt.date >= m0) & (daily_basis["date"].dt.date <= m1)]
+    month_pnl  = float(month_rows["pnl"].sum()) if not month_rows.empty else 0.0
+    month_fees = float(month_rows["fees"].sum()) if not month_rows.empty else 0.0
+
+    total_pnl  = float(daily_basis["pnl"].sum())
+    total_fees = float(daily_basis["fees"].sum())
+
+    year = selected_day.year
+    y0, y1 = date(year,1,1), date(year,12,31)
+    ytd_rows = daily_basis[(daily_basis["date"].dt.date >= y0) & (daily_basis["date"].dt.date <= y1)]
+    ytd_pnl = float(ytd_rows["pnl"].sum()) if not ytd_rows.empty else 0.0
+
+    # Win-rate / averages (count only days with trades)
+    trades_days = daily_basis[daily_basis["trades"] > 0].copy()
+    wins = (trades_days["pnl"] > 0).sum()
+    total_trade_days = len(trades_days)
+    win_rate = (wins / total_trade_days * 100.0) if total_trade_days else 0.0
+    avg_daily = trades_days["pnl"].mean() if total_trade_days else 0.0
+
+    # Best/Worst
+    best_row, worst_row = best_worst_day(daily_basis)
+
     def metric_row(label, value):
         st.markdown(f"**{label}:** {style_currency(value)}")
-    metric_row("Selected Day P&L (Net)", day_pnl)
-    metric_row("Selected Day Fees", day_fees)
-    st.divider()
-    metric_row(f"{current_month.strftime('%B %Y')} P&L (Net)", monthly_pnl)
-    metric_row(f"{current_month.strftime('%B %Y')} Fees", monthly_fees)
-    st.divider()
-    metric_row("Total P&L (all data, Net)", total_pnl)
-    metric_row("Total Fees (all data)", total_fees)
 
-st.caption("Tip: Click a day in the calendar. 🟢 profit, 🔴 loss, ⚪ no trades.")
+    if "sel_day_pnl" in selected_keys:
+        metric_row("Selected Day P&L", day_pnl)
+    if "sel_day_fees" in selected_keys:
+        metric_row("Selected Day Fees", day_fees)
+    if "sel_day_trades" in selected_keys:
+        st.markdown(f"**Selected Day #Trades:** {day_trade_count}")
+
+    if "month_pnl" in selected_keys:
+        metric_row(f"{current_month.strftime('%B %Y')} P&L", month_pnl)
+    if "month_fees" in selected_keys:
+        metric_row(f"{current_month.strftime('%B %Y')} Fees", month_fees)
+    if "month_winners_losers" in selected_keys:
+        # concat unique winners/losers for the month
+        rng = pd.date_range(m0, m1, freq="D")
+        winners_month = _names_list(pd.Series([day_winners.get(pd.Timestamp(d), None) for d in rng]).str.split(", ").explode())
+        losers_month  = _names_list(pd.Series([day_losers.get(pd.Timestamp(d), None) for d in rng]).str.split(", ").explode())
+        st.markdown(f"**Month Winners:** {winners_month}")
+        st.markdown(f"**Month Losers:** {losers_month}")
+
+    if "ytd_pnl" in selected_keys:
+        metric_row("YTD P&L", ytd_pnl)
+
+    if "total_pnl" in selected_keys:
+        metric_row("Total P&L (all data)", total_pnl)
+    if "total_fees" in selected_keys:
+        metric_row("Total Fees (all data)", total_fees)
+
+    if "win_rate" in selected_keys:
+        st.markdown(f"**Win rate (days with trades):** {win_rate:.1f}%")
+    if "avg_daily" in selected_keys:
+        st.markdown(f"**Average daily P&L (with trades):** {style_currency(avg_daily)}")
+
+    if "best_worst" in selected_keys:
+        if best_row is not None:
+            st.markdown(f"**Best Day:** {best_row['date'].date()} — {style_currency(best_row['pnl'])}")
+        if worst_row is not None:
+            st.markdown(f"**Worst Day:** {worst_row['date'].date()} — {style_currency(worst_row['pnl'])}")
+
+st.caption("Tip: Click a day in the calendar. Tooltips show winners & losers; right panel is fully customizable.")
 
 # -----------------------------
 # Performance Graph (no 'Daily' option)
