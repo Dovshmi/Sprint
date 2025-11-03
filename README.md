@@ -1,4 +1,4 @@
-# Webstock — Trade Calendar & Performance Dashboard
+# Sprint — Trade Calendar & Performance Dashboard
 
 [![Made with Python](https://img.shields.io/badge/Made%20with-Python-3776AB.svg)](https://www.python.org/)
 [![Streamlit](https://img.shields.io/badge/Streamlit-App-FF4B4B.svg)](https://streamlit.io/)
@@ -8,7 +8,7 @@
 
 A clean, fast Streamlit app for **Colmex Pro** traders to visualize filled orders as an interactive **calendar**, drill into **daily trades**, and track **weekly / monthly / yearly performance** with simple, beautiful charts.
 
-> Current baseline: **v9** (`Webstock_v9.py`)
+> Current baseline: **1.3** (`Webstock.py`)
 
 ---
 
@@ -29,29 +29,25 @@ A clean, fast Streamlit app for **Colmex Pro** traders to visualize filled order
 
 ## 📸 Screenshots / GIFs
 
-> Add these files under `assets/` and GitHub will render them automatically.
-
 <p align="center">
-  <img src="assets/calendar.png" alt="Calendar view with day bubbles" width="85%"><br/>
+  <img src="images/calendar.png" alt="Calendar view with day bubbles" width="100%"><br/>
   <em>Clickable calendar — select a day to see its trades</em>
 </p>
 
 <p align="center">
-  <img src="assets/weekly_chart.png" alt="Weekly performance chart" width="85%"><br/>
-  <em>Weekly P&L — line + dots with winners/losers in tooltips</em>
+  <img src="images/full calendar.png" alt="Weekly performance chart" width="100%"><br/>
+  <em>Summery of all the trades</em>
 </p>
 
 <p align="center">
-  <img src="assets/summary_popover.png" alt="Summary dropdown" width="70%"><br/>
-  <em>Summary dropdown with customizable metrics</em>
+  <img src="images/Graph.png" alt="Summary dropdown" width="110%"><br/>
+  <em>Weekly P&L — line + dots with winners/losers in tooltips</em>
 </p>
 
 <p align="center">
   <img src="assets/flow.gif" alt="Short demo" width="85%"><br/>
   <em>Quick flow demo (upload → calendar → charts)</em>
 </p>
-
-> Tip: To record a lightweight GIF on Windows, try **ShareX** or **ScreenToGif**. Keep it ~5–10 seconds for small file size.
 
 ---
 
@@ -171,3 +167,6 @@ PRs are welcome! If you’re adding features or changing UX, please:
 ## 📜 License
 
 This project is released under the **MIT License**. See the [LICENSE](LICENSE) file for details.
+
+Made by Rony Shmidov 
+By Dovshmi
