@@ -1,4 +1,4 @@
-# Webstock_v6.py
+# Webstock_v8.py
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -49,11 +49,15 @@ def load_colmex_csv(file) -> pd.DataFrame:
     fees = df["Execution fee"] if "Execution fee" in df.columns else 0.0
     df["__fees__"] = pd.to_numeric(fees, errors="coerce").fillna(0.0).astype(float)
     df["Net P/L"] = pd.to_numeric(df["Net P/L"], errors="coerce").fillna(0.0).astype(float)
+    if "Gross P/L" in df.columns:
+        df["Gross P/L"] = pd.to_numeric(df["Gross P/L"], errors="coerce").fillna(0.0).astype(float)
+    else:
+        df["Gross P/L"] = df["Net P/L"] + df["__fees__"]
     return df
 
-def build_daily_pnl(df: pd.DataFrame) -> pd.DataFrame:
+def build_daily(df: pd.DataFrame, pnl_col: str) -> pd.DataFrame:
     g = df.groupby("date", as_index=False).agg(
-        pnl=("Net P/L", "sum"),
+        pnl=(pnl_col, "sum"),
         fees=("__fees__", "sum"),
         trades=("Symbol", "count") if "Symbol" in df.columns else ("date", "count")
     )
@@ -85,33 +89,31 @@ def sunday_week_bounds(d: date):
     end = start + timedelta(days=6)
     return start, end
 
-# Winners helpers
-def winners_by_day_from_raw(raw: pd.DataFrame) -> dict:
-    if "Symbol" not in raw.columns:
-        return {}
-    tmp = (raw.groupby(["date","Symbol"], as_index=False)["Net P/L"].sum())
-    tmp = tmp[tmp["Net P/L"] > 0]
-    winners = (tmp.groupby("date")["Symbol"]
-                 .apply(lambda s: ", ".join(sorted(set(s))))
-                 .to_dict())
-    return winners
+# Winners/Losers helpers (by Net P/L sign)
+def _names_for_sign(series: pd.Series) -> str:
+    s = sorted(set(series.dropna().tolist()))
+    return ", ".join(s) if s else "—"
 
-def winners_by_week_from_raw(raw: pd.DataFrame) -> dict:
+def winners_losers_by_day(raw: pd.DataFrame):
     if "Symbol" not in raw.columns:
-        return {}
-    # Week ends Saturday; compute week_end for each trade
-    wd = raw["date"].dt.weekday  # Mon 0 ... Sun 6
-    # Days until Saturday (5)
+        return {}, {}
+    tmp = raw.groupby(["date","Symbol"], as_index=False)["Net P/L"].sum()
+    winners = tmp[tmp["Net P/L"] > 0].groupby("date")["Symbol"].apply(_names_for_sign).to_dict()
+    losers  = tmp[tmp["Net P/L"] < 0].groupby("date")["Symbol"].apply(_names_for_sign).to_dict()
+    return winners, losers
+
+def winners_losers_by_week(raw: pd.DataFrame):
+    if "Symbol" not in raw.columns:
+        return {}, {}
+    wd = raw["date"].dt.weekday
     days_to_sat = (5 - wd) % 7
     week_end = raw["date"] + pd.to_timedelta(days_to_sat, unit="D")
     tmp = raw.copy()
     tmp["week_end"] = week_end
-    g = (tmp.groupby(["week_end","Symbol"], as_index=False)["Net P/L"].sum())
-    g = g[g["Net P/L"] > 0]
-    winners = (g.groupby("week_end")["Symbol"]
-                 .apply(lambda s: ", ".join(sorted(set(s))))
-                 .to_dict())
-    return winners
+    g = tmp.groupby(["week_end","Symbol"], as_index=False)["Net P/L"].sum()
+    winners = g[g["Net P/L"] > 0].groupby("week_end")["Symbol"].apply(_names_for_sign).to_dict()
+    losers  = g[g["Net P/L"] < 0].groupby("week_end")["Symbol"].apply(_names_for_sign).to_dict()
+    return winners, losers
 
 # -----------------------------
 # Streamlit App
@@ -139,13 +141,14 @@ if raw.empty:
     st.warning("No rows found after parsing. Check your file.")
     st.stop()
 
-daily = build_daily_pnl(raw)
-min_day = daily["date"].min().date()
-max_day = daily["date"].max().date()
+# Precompute winners/losers (by Net P/L)
+day_winners, day_losers   = winners_losers_by_day(raw)
+week_winners, week_losers = winners_losers_by_week(raw)
 
-# Precompute winners maps
-day_winners = winners_by_day_from_raw(raw)
-week_winners = winners_by_week_from_raw(raw)
+# Data for calendar (Net P&L)
+daily_net = build_daily(raw, "Net P/L")
+min_day = daily_net["date"].min().date()
+max_day = daily_net["date"].max().date()
 
 # -----------------------------
 # Session state
@@ -183,8 +186,8 @@ with nav_r:
 
 # Current month slice
 m_start, m_end = month_bounds(st.session_state.current_month)
-month_mask = (daily["date"].dt.date >= m_start) & (daily["date"].dt.date <= m_end)
-month_df = daily.loc[month_mask].copy()
+month_mask = (daily_net["date"].dt.date >= m_start) & (daily_net["date"].dt.date <= m_end)
+month_df = daily_net.loc[month_mask].copy()
 
 # Maps for calendar bubbles
 pnl_map = {d.date(): float(p) for d, p in zip(month_df["date"], month_df["pnl"])}
@@ -219,8 +222,46 @@ for week in day_rows:
                 st.session_state.selected_day = d
                 selected_day = d
 
+# ---------- Day details panel (RESTORED) ----------
+left, right = st.columns([3,2], vertical_alignment="top")
+with left:
+    st.subheader(f"Trades on {selected_day}")
+    day_trades = raw.loc[raw["date"].dt.date == selected_day].copy()
+    if day_trades.empty:
+        st.info("No trades on this date.")
+    else:
+        show_cols = ["Date/Time","Symbol","Side","Quantity","Price","Gross P/L","Execution fee","Net P/L","Description"]
+        existing_cols = [c for c in show_cols if c in day_trades.columns]
+        for cc in ["Price","Gross P/L","Execution fee","Net P/L"]:
+            if cc in day_trades.columns:
+                day_trades[cc] = day_trades[cc].apply(lambda x: style_currency(x) if pd.notna(x) else x)
+        st.dataframe(day_trades[existing_cols], use_container_width=True, hide_index=True)
+
+with right:
+    st.subheader("Summary")
+    sel = daily_net[daily_net["date"].dt.date == selected_day]
+    day_pnl  = float(sel["pnl"].sum()) if not sel.empty else 0.0
+    day_fees = float(sel["fees"].sum()) if not sel.empty else 0.0
+    # Month totals (net)
+    monthly_pnl  = float(month_df["pnl"].sum()) if not month_df.empty else 0.0
+    monthly_fees = float(month_df["fees"].sum()) if not month_df.empty else 0.0
+    total_pnl  = float(daily_net["pnl"].sum())
+    total_fees = float(daily_net["fees"].sum())
+    def metric_row(label, value):
+        st.markdown(f"**{label}:** {style_currency(value)}")
+    metric_row("Selected Day P&L (Net)", day_pnl)
+    metric_row("Selected Day Fees", day_fees)
+    st.divider()
+    metric_row(f"{current_month.strftime('%B %Y')} P&L (Net)", monthly_pnl)
+    metric_row(f"{current_month.strftime('%B %Y')} Fees", monthly_fees)
+    st.divider()
+    metric_row("Total P&L (all data, Net)", total_pnl)
+    metric_row("Total Fees (all data)", total_fees)
+
+st.caption("Tip: Click a day in the calendar. 🟢 profit, 🔴 loss, ⚪ no trades.")
+
 # -----------------------------
-# Graph: style toggle + rich tooltips
+# Performance Graph (no 'Daily' option)
 # -----------------------------
 st.subheader("Performance Graph")
 
@@ -235,8 +276,13 @@ def alt_theme():
 alt.themes.register("minimal_trade_theme", alt_theme)
 alt.themes.enable("minimal_trade_theme")
 
-view = st.selectbox("View", ["Daily", "Weekly", "Monthly", "Yearly"], index=0)
+view = st.selectbox("View", ["Weekly", "Monthly", "Yearly"], index=0)
 style = st.radio("Graph style", ["Line + dots", "Bars"], horizontal=True)
+basis = st.radio("P&L basis", ["Net (after fees)", "Gross (before fees)"], horizontal=True, index=0)
+show_fees = st.checkbox("Show fees in tooltips", value=True)
+
+basis_col = "Net P/L" if basis.startswith("Net") else "Gross P/L"
+daily_basis = build_daily(raw, basis_col)
 
 def render_chart(df, x_field, x_title, tooltips):
     if df.empty:
@@ -253,76 +299,61 @@ def render_chart(df, x_field, x_title, tooltips):
         chart = base.mark_line(size=1) + base.mark_point(size=60, filled=True)
     st.altair_chart(chart.interactive(), use_container_width=True)
 
-# DAILY — x = trade time, tooltip = trade details
-if view == "Daily":
-    dtr = raw.loc[raw["date"].dt.date == selected_day].copy()
-    if dtr.empty:
-        st.info("No trades on the selected day.")
-    else:
-        dtr = dtr.sort_values("datetime").reset_index(drop=True)
-        dtr["cum_pnl"] = dtr["Net P/L"].cumsum()
-        cols = ["datetime","cum_pnl","Net P/L","Symbol","Side","Quantity","Price","Description"]
-        tooltips = []
-        for c in cols:
-            if c in dtr.columns:
-                if c in ["cum_pnl","Net P/L","Price"]:
-                    tooltips.append(alt.Tooltip(c, title=c.replace("_"," ").title(), format="$.2f"))
-                else:
-                    tooltips.append(alt.Tooltip(c, title=c))
-        dplot = dtr.rename(columns={"cum_pnl":"pnl"})
-        render_chart(dplot, "datetime:T", "Time", tooltips)
-
-# WEEKLY — Sunday→Saturday, fill missing days; tooltip shows winners
-elif view == "Weekly":
+# WEEKLY — Sunday→Saturday, tooltip shows winners & losers
+if view == "Weekly":
     w_start, w_end = sunday_week_bounds(selected_day)
     rng = pd.date_range(w_start, w_end, freq="D")
-    wk = daily.loc[(daily["date"].dt.date >= w_start) & (daily["date"].dt.date <= w_end)][["date","pnl","fees","trades"]].copy()
+    wk = daily_basis.loc[(daily_basis["date"].dt.date >= w_start) & (daily_basis["date"].dt.date <= w_end)][["date","pnl","fees","trades"]].copy()
     wk = wk.set_index("date").reindex(rng, fill_value=0.0).rename_axis("date").reset_index()
-    # winners per day
-    wk["winners"] = wk["date"].map(day_winners).fillna("—")
+    wk["Winners"] = wk["date"].map(day_winners).fillna("—")
+    wk["Losers"]  = wk["date"].map(day_losers).fillna("—")
     tooltips = [
-        alt.Tooltip("winners:N", title="Winners"),
+        alt.Tooltip("Winners:N", title="Winners"),
+        alt.Tooltip("Losers:N", title="Losers"),
         alt.Tooltip("pnl:Q", title="P&L", format="$.2f"),
     ]
-    if "fees" in wk.columns: tooltips.append(alt.Tooltip("fees:Q", title="Fees", format="$.2f"))
-    if "trades" in wk.columns: tooltips.append(alt.Tooltip("trades:Q", title="Trades"))
+    if show_fees and "fees" in wk.columns:
+        tooltips.append(alt.Tooltip("fees:Q", title="Fees", format="$.2f"))
+    if "trades" in wk.columns:
+        tooltips.append(alt.Tooltip("trades:Q", title="Trades"))
     render_chart(wk.rename(columns={"date":"x"}), "x:T", f"Week {w_start.isoformat()} → {w_end.isoformat()}", tooltips)
 
-# MONTHLY — all days in current month, tooltip shows winners
+# MONTHLY — all days in current month
 elif view == "Monthly":
     m0, m1 = month_bounds(current_month)
     rng = pd.date_range(m0, m1, freq="D")
-    md = month_df[["date","pnl","fees","trades"]].copy()
+    md = daily_basis.loc[(daily_basis["date"].dt.date >= m0) & (daily_basis["date"].dt.date <= m1)][["date","pnl","fees","trades"]].copy()
     md = md.set_index("date").reindex(rng, fill_value=0.0).rename_axis("date").reset_index()
-    md["winners"] = md["date"].map(day_winners).fillna("—")
+    md["Winners"] = md["date"].map(day_winners).fillna("—")
+    md["Losers"]  = md["date"].map(day_losers).fillna("—")
     tooltips = [
-        alt.Tooltip("winners:N", title="Winners"),
+        alt.Tooltip("Winners:N", title="Winners"),
+        alt.Tooltip("Losers:N", title="Losers"),
         alt.Tooltip("pnl:Q", title="P&L", format="$.2f"),
     ]
-    if "fees" in md.columns: tooltips.append(alt.Tooltip("fees:Q", title="Fees", format="$.2f"))
-    if "trades" in md.columns: tooltips.append(alt.Tooltip("trades:Q", title="Trades"))
+    if show_fees and "fees" in md.columns:
+        tooltips.append(alt.Tooltip("fees:Q", title="Fees", format="$.2f"))
+    if "trades" in md.columns:
+        tooltips.append(alt.Tooltip("trades:Q", title="Trades"))
     render_chart(md.rename(columns={"date":"x"}), "x:T", current_month.strftime("Days of %B %Y"), tooltips)
 
-# YEARLY — aggregate by week (Sun→Sat), tooltip shows weekly winners
+# YEARLY — aggregate by week (Sun→Sat)
 elif view == "Yearly":
     year = selected_day.year
     y0 = date(year, 1, 1); y1 = date(year, 12, 31)
-    yr = daily.loc[(daily["date"].dt.date >= y0) & (daily["date"].dt.date <= y1)][["date","pnl","fees"]].copy()
-    # Weekly resample ending on Saturday
-    yr = (yr.set_index("date")
-            .resample("W-SAT").sum()
-            .rename_axis("week_end")
-            .reset_index())
-    # ensure full continuous weekly index
+    yr = daily_basis.loc[(daily_basis["date"].dt.date >= y0) & (daily_basis["date"].dt.date <= y1)][["date","pnl","fees"]].copy()
+    yr = (yr.set_index("date").resample("W-SAT").sum().rename_axis("week_end").reset_index())
     full_weeks = pd.date_range(pd.Timestamp(y0), pd.Timestamp(y1), freq="W-SAT")
     yr = yr.set_index("week_end").reindex(full_weeks, fill_value=0.0).rename_axis("week_end").reset_index()
     yr["week_start"] = yr["week_end"] - pd.Timedelta(days=6)
-    # attach winners by week
-    yr["winners"] = yr["week_end"].map(week_winners).fillna("—")
+    yr["Winners"] = yr["week_end"].map(week_winners).fillna("—")
+    yr["Losers"]  = yr["week_end"].map(week_losers).fillna("—")
     yr = yr.rename(columns={"week_end":"x"})
     tooltips = [
-        alt.Tooltip("winners:N", title="Winners"),
+        alt.Tooltip("Winners:N", title="Winners"),
+        alt.Tooltip("Losers:N", title="Losers"),
         alt.Tooltip("pnl:Q", title="P&L", format="$.2f"),
     ]
-    if "fees" in yr.columns: tooltips.append(alt.Tooltip("fees:Q", title="Fees", format="$.2f"))
+    if show_fees and "fees" in yr.columns:
+        tooltips.append(alt.Tooltip("fees:Q", title="Fees", format="$.2f"))
     render_chart(yr, "x:T", f"Weeks of {year}", tooltips)
